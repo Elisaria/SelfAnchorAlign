@@ -1,5 +1,5 @@
 from keras.src.layers.layer import Layer
-from keras.src.layers import LayerNormalization, Dense
+from keras.src.layers import Dense
 from tensorflow import gather, linalg, shape, Variable, reduce_mean
 from keras.src import ops
 
@@ -10,57 +10,54 @@ class Attention_Block(Layer):
 
     def __init__(self, num_heads=4, dim=512, trainable=True, causal_mask=False, **kwargs):
         super().__init__(**kwargs)
-        # ============ Precompute =================#
-        # rotation indices [1, 0, 3, 2, 5, 4, ...]
-        self.indices = ops.convert_to_tensor(
-            [i ^ 1 for i in range(dim)]
-        )
-        self.cos, self.sin = self.rope_scales([72, dim])
-        # =========================================#
         self.dim = dim
+        self.half_dim = dim // 2
         self.num_heads = num_heads
         self.trainable = trainable
         self.causal_mask = causal_mask
 
+        # ============ Precompute =================#
+        # rotation indices [1, 0, 3, 2, 5, 4, ...]
+        self.indices = ops.convert_to_tensor(
+            [i ^ 1 for i in range(self.half_dim)]
+        )
+        self.cos, self.sin = self.rope_scales([50, self.half_dim])
+        # =========================================#
+
     def build(self, input_shape):
         in_dim = input_shape[-1]
-        self.query_kernel = self.add_weight(shape=[in_dim, self.dim],
+        self.query_kernel = self.add_weight(shape=[in_dim, self.half_dim],
                                             trainable=self.trainable,
-                                            regularizer='l2',
                                             name='query_kernel')
-        self.key_kernel = self.add_weight(shape=[in_dim, self.dim],
+        self.key_kernel = self.add_weight(shape=[in_dim, self.half_dim],
                                           trainable=self.trainable,
-                                          regularizer='l2',
                                           name='key_kernel')
-        self.up_kernel = self.add_weight(shape=[self.dim, 2 * self.dim],
-                                         trainable=self.trainable,
-                                         name='up_kernel')
-        self.up_bias = self.add_weight(shape=[2 * self.dim, ],
-                                       trainable=self.trainable,
-                                       name='up_bias')
-        self.down_kernel = self.add_weight(shape=[2 * self.dim, self.dim],
-                                           trainable=self.trainable,
-                                           name='down_kernel')
-        self.down_bias = self.add_weight(shape=[self.dim, ],
-                                         trainable=self.trainable,
-                                         name='down_bias')
+        self.value_kernel = self.add_weight(shape=[in_dim, self.dim],
+                                            trainable=self.trainable,
+                                            name='value_kernel')
+        self.W1 = self.add_weight(shape=[self.dim, 2 * self.dim],
+                                  trainable=self.trainable,
+                                  name='W1')
+        self.W2 = self.add_weight(shape=[self.dim, 2 * self.dim],
+                                  trainable=self.trainable,
+                                  name='W2')
+        self.W3 = self.add_weight(shape=[2 * self.dim, self.dim],
+                                  trainable=self.trainable,
+                                  name='W3')
         self.gamma = self.add_weight(shape=[self.dim, ],
                                      trainable=self.trainable,
-                                     name='gamma')
-        self.beta = self.add_weight(shape=[self.dim, ],
-                                    trainable=self.trainable,
-                                    name='beta')
+                                     name='gamma',
+                                     initializer='ones')
 
     def load_own_variables(self, store):
         """ store: dict, {
-                          'query_kernel': arr(in_dim, dim),
-                          'key_kernel': arr(in_dim, dim),
-                          'up_kernel': arr(dim, 2*dim),
-                          'up_bias' : arr(2*dim, )
-                          'down_kernel': arr(2*dim, dim),
-                          'down_bias' : arr(dim, ),
+                          'query_kernel': arr(in_dim, half_dim),
+                          'key_kernel': arr(in_dim, half_dim),
+                          'value_kernel': arr(dim, dim),
+                          'W1': arr(dim, 2*dim),
+                          'W2': arr(dim, 2*dim),
+                          'W3': arr(dim, dim),
                           'gamma' : arr(dim, )
-                          'beta' : arr(dim, )
                          }
                 """
         for weight in self.weights:
@@ -89,10 +86,10 @@ class Attention_Block(Layer):
         mask = ops.tile(ops.expand_dims(mask, axis=1), [1, self.num_heads, 1, 1])
         return mask
 
-    def LayerNorm(self, inputs):
-        x = (inputs - ops.mean(inputs, axis=-1, keepdims=True)) / ops.sqrt(
+    def RMSNorm(self, inputs):
+        x = inputs / ops.sqrt(
             ops.var(inputs, axis=-1, keepdims=True) + 1e-3)
-        x = self.gamma * x + self.beta
+        x = self.gamma * x
         return x
 
     def call(self, inputs, training=False):
@@ -100,18 +97,19 @@ class Attention_Block(Layer):
         B = shape(inputs)[0]
         L = shape(inputs)[1]
 
-        value = self.LayerNorm(inputs)
+        value = self.RMSNorm(inputs)
+        value = ops.matmul(value, self.value_kernel)
         value = ops.reshape(value, (B, L, self.num_heads, self.dim // self.num_heads))
 
         query = ops.matmul(inputs, self.query_kernel)
         query = query * self.cos[:L] + self.rotate(query) * self.sin[:L]
-        query = ops.reshape(query, (B, L, self.num_heads, self.dim // self.num_heads))
+        query = ops.reshape(query, (B, L, self.num_heads, self.half_dim // self.num_heads))
 
         key = ops.matmul(inputs, self.key_kernel)
         key = key * self.cos[:L] + self.rotate(key) * self.sin[:L]
-        key = ops.reshape(key, (B, L, self.num_heads, self.dim // self.num_heads))
+        key = ops.reshape(key, (B, L, self.num_heads, self.half_dim // self.num_heads))
 
-        k = ops.sqrt(ops.cast(self.dim, dtype='float32'))
+        k = ops.sqrt(ops.cast(self.half_dim, dtype='float32'))
         dots = ops.einsum("aecd, abcd -> acbe", key, query) / k
         dots_mask = ops.full(shape(dots), True, dtype='bool')
         if mask is not None:
@@ -124,10 +122,10 @@ class Attention_Block(Layer):
         x = ops.einsum("acbe,aecd->abcd", scores, value)
         x = ops.reshape(x, (B, L, self.dim))
 
-        x = self.LayerNorm(x + inputs)
-        temp = ops.matmul(x, self.up_kernel) + self.up_bias
-        temp = ops.matmul(temp, self.down_kernel) + self.down_bias
-        y = ops.gelu(x + temp)
+        x = self.RMSNorm(x + inputs)
+        temp = ops.matmul(x, self.W2) * ops.sigmoid(ops.matmul(x, self.W1))
+        temp = ops.matmul(temp, self.W3)
+        y = x + temp
         setattr(y, '_keras_mask', mask)
         return y
 
@@ -136,7 +134,6 @@ class Text_Encoder(Layer):
     def __init__(self, num_layers=4):
         super().__init__()
         self.ABs = [Attention_Block(name='AB' + str(_)) for _ in range(num_layers)]
-        self.LayerNorm = LayerNormalization(name='LN')
         self.linear_projection = Dense(512, name='linear_projection')
 
     # input : (B, L, 512)
@@ -144,16 +141,14 @@ class Text_Encoder(Layer):
     def call(self, x, *args, **kwargs):
         for AB in self.ABs:
             x = AB(x)
-        x = self.LayerNorm(x)
         return self.linear_projection(x)
 
 
 class Vit(Layer):
-    def __init__(self, num_layers=4):
+    def __init__(self, num_layers=8):
         super().__init__()
         self.in_ = Dense(512, name='in_')
         self.ABs = [Attention_Block(name='AB' + str(_)) for _ in range(num_layers)]
-        self.LayerNorm = LayerNormalization(name='LN')
         self.linear_projection = Dense(512, name='linear_projection')
 
     def build(self, input_shape):
@@ -168,7 +163,6 @@ class Vit(Layer):
         x = ops.concatenate([ops.tile(self.CLS, [shape(x)[0], 1, 1]), x], axis=-2)
         for AB in self.ABs:
             x = AB(x)
-        x = self.LayerNorm(x)
         return self.linear_projection(x)
 
 
@@ -176,7 +170,6 @@ class Text_Decoder(Layer):
     def __init__(self, vocab_size, num_layers=4):
         super().__init__()
         self.ABs = [Attention_Block(causal_mask=True, name='AB' + str(_)) for _ in range(num_layers)]
-        self.LayerNorm = LayerNormalization(name='LN')
         self.predict_head = Dense(vocab_size, activation='softmax', name='predict_head')
 
     # input : (B, L, 512)
@@ -184,21 +177,19 @@ class Text_Decoder(Layer):
     def call(self, x, *args, **kwargs):
         for AB in self.ABs:
             x = AB(x)
-        x = self.LayerNorm(x)
         return self.predict_head(x)
 
 
 if __name__ == '__main__':
     data = ops.random.uniform((1, 4, 512))
     store = {
-        'query_kernel': Variable(ops.ones((512, 512), 'float32')),
-        'key_kernel': 2. * Variable(ops.ones((512, 512), 'float32')),
-        'up_kernel': 3. * Variable(ops.ones((512, 1024), 'float32')),
-        'up_bias': 4. * Variable(ops.ones((1024,), 'float32')),
-        'down_kernel': 5. * Variable(ops.ones((1024, 512), 'float32')),
-        'down_bias': 6. * Variable(ops.ones((512,), 'float32')),
-        'gamma': 7. * Variable(ops.ones((512,), 'float32')),
-        'beta': 8. * Variable(ops.ones((512,), 'float32'))
+        'query_kernel': Variable(ops.ones((512, 256), 'float32')),
+        'key_kernel': 2. * Variable(ops.ones((512, 256), 'float32')),
+        'value_kernel': 3. * Variable(ops.ones((512, 512), 'float32')),
+        'W1': 4. * Variable(ops.ones((512, 1024), 'float32')),
+        'W2': 5. * Variable(ops.ones((512, 1024), 'float32')),
+        'W3': 6. * Variable(ops.ones((1024, 512), 'float32')),
+        'gamma': 7. * Variable(ops.ones((512,), 'float32'))
     }
 
     model = Attention_Block()
