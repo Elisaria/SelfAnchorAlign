@@ -131,7 +131,7 @@ class Attention_Block(Layer):
 
 
 class Text_Encoder(Layer):
-    def __init__(self, num_layers=4):
+    def __init__(self, num_layers=8):
         super().__init__()
         self.ABs = [Attention_Block(name='AB' + str(_)) for _ in range(num_layers)]
         self.linear_projection = Dense(512, name='linear_projection')
