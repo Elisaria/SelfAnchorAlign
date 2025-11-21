@@ -161,6 +161,9 @@ class Vit(Layer):
         self.CLS = self.add_weight(name='CLS',
                                    shape=[1, 1, 512])
 
+    def compute_mask(self, inputs, previous_mask):
+        return previous_mask
+
     # input : patches (B, L, patch_pixels)
     # output : (B, L+1, 512)
     def call(self, x, *args, **kwargs):
