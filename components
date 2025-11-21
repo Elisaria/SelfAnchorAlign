@@ -1,6 +1,6 @@
 from keras.src.layers.layer import Layer
 from keras.src.layers import Dense
-from tensorflow import gather, linalg, shape, Variable, reduce_mean
+from tensorflow import gather, linalg, shape, Variable, reduce_mean, print
 from keras.src import ops
 
 
@@ -62,6 +62,9 @@ class Attention_Block(Layer):
                 """
         for weight in self.weights:
             weight.assign(store[weight.path.split('/')[-1]])
+
+    def compute_mask(self, inputs, previous_mask):
+        return previous_mask
 
     def rope_scales(self, input_shape):
         seq_len = input_shape[-2]
@@ -136,6 +139,9 @@ class Text_Encoder(Layer):
         self.ABs = [Attention_Block(name='AB' + str(_)) for _ in range(num_layers)]
         self.linear_projection = Dense(512, name='linear_projection')
 
+    def compute_mask(self, inputs, previous_mask):
+        return previous_mask
+
     # input : (B, L, 512)
     # output : (B, L, 512)
     def call(self, x, *args, **kwargs):
@@ -171,6 +177,9 @@ class Text_Decoder(Layer):
         super().__init__()
         self.ABs = [Attention_Block(causal_mask=True, name='AB' + str(_)) for _ in range(num_layers)]
         self.predict_head = Dense(vocab_size, activation='softmax', name='predict_head')
+
+    def compute_mask(self, inputs, previous_mask):
+        return previous_mask
 
     # input : (B, L, 512)
     # output : (B, L, vocab_size)
