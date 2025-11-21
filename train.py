@@ -30,20 +30,28 @@ def save_weights(model, file):
 
 
 if __name__ == '__main__':
-    input_text = np.load('data/input_text.npy')
-    patches = np.load('data/patches.npy')
-    output_text = np.load('data/output_text.npy')
+    # (B, L)
+    input_text = ''
+    # (B, N, C)
+    patches = ''
+    # (B, N, C)
+    aug_patches = ''
+    # (B, L)
+    output_text = ''
 
-    train_dataset = data.Dataset.from_tensor_slices(((input_text, patches, patches), output_text)).batch(60)
+    train_dataset = data.Dataset.from_tensor_slices(((input_text, patches, patches), output_text)).batch(512)
 
     model = SAA(vocab_size=10002)
-    model.compile(optimizer=optimizers.AdamW(learning_rate=0.0001,
-                                             weight_decay=0.000001,
-                                             ),
+    schedule = optimizers.schedules.CosineDecay(initial_learning_rate=0.0001,
+                                                decay_steps=100000,
+                                                alpha=0.0001)
+    model.compile(optimizer=optimizers.AdamW(learning_rate=schedule,
+                                             weight_decay=0.000001),
                   loss=mask_loss,
                   metrics=[metrics.MeanMetricWrapper(fn=accuracy, name='accuracy')]
                   )
     model.fit(train_dataset,
-              epochs=200
+              epochs=256
               )
     save_weights(model, 'weights.npy')
+
